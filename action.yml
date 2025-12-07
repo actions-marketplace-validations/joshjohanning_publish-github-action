@@ -8,6 +8,10 @@ inputs:
   github_token:
     description: 'Token for the github API'
     required: true
+  github_api_url:
+    description: 'GitHub API URL (e.g., https://api.github.com for GitHub.com or https://ghes.domain.com/api/v3 for GHES)'
+    required: false
+    default: '${{ github.api_url }}'
   npm_package_command:
     description: 'Command to build the action'
     default: 'npm run package'
@@ -15,6 +19,10 @@ inputs:
   commit_node_modules:
     description: 'Change to true to commit node_modules folder'
     default: 'false'
+    required: false
+  commit_dist_folder:
+    description: 'Change to true to commit dist folder'
+    default: 'true'
     required: false
   publish_minor_version:
     description: 'Change to true to publish minor version'
@@ -24,6 +32,10 @@ inputs:
     description: 'Change to true to publish release branch'
     default: 'false'
     required: false
+  create_release_as_draft:
+    description: 'Change to true to create release as draft'
+    default: 'false'
+    required: false
 runs:
   using: 'node20'
-  main: 'lib/main.js'
+  main: 'dist/index.js'
