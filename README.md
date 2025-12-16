@@ -21,16 +21,17 @@ Based on the [tgymnich/publish-github-action](https://github.com/tgymnich/publis
 
 ## Inputs
 
-| Input                     | Description                                                                                                                                                                                                                                                                                                  | Required | Default                 |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------- | ----------------------- |
-| `github_token`            | Token for the GitHub API                                                                                                                                                                                                                                                                                     | Yes      | -                       |
-| `github_api_url`          | GitHub API URL (e.g., `https://api.github.com` for GitHub.com or `https://ghes.domain.com/api/v3` for GHES)                                                                                                                                                                                                  | No       | `${{ github.api_url }}` |
-| `npm_package_command`     | Command to build the action                                                                                                                                                                                                                                                                                  | No       | `npm run package`       |
-| `commit_node_modules`     | Whether to commit `node_modules` folder. **Note:** When set to `true`, commits will NOT be verified due to API limitations with large file counts                                                                                                                                                            | No       | `false`                 |
-| `commit_dist_folder`      | Whether to commit `dist` folder                                                                                                                                                                                                                                                                              | No       | `true`                  |
-| `publish_minor_version`   | Whether to publish minor version tag (e.g., `v1.2`)                                                                                                                                                                                                                                                          | No       | `false`                 |
-| `publish_release_branch`  | Whether to publish release branch (e.g., `releases/v1.2.3`)                                                                                                                                                                                                                                                  | No       | `false`                 |
-| `create_release_as_draft` | Whether to create release as draft to allow review of the release before publishing; useful with [immutable releases](https://docs.github.com/en/actions/how-tos/create-and-publish-actions/using-immutable-releases-and-tags-to-manage-your-actions-releases) where changes cannot be made after publishing | No       | `false`                 |
+| Input                       | Description                                                                                                                                                                                                                                                                                                  | Required | Default                 |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------- | ----------------------- |
+| `github_token`              | Token for the GitHub API                                                                                                                                                                                                                                                                                     | Yes      | -                       |
+| `github_api_url`            | GitHub API URL (e.g., `https://api.github.com` for GitHub.com or `https://ghes.domain.com/api/v3` for GHES)                                                                                                                                                                                                  | No       | `${{ github.api_url }}` |
+| `npm_package_command`       | Command to build the action                                                                                                                                                                                                                                                                                  | No       | `npm run package`       |
+| `commit_node_modules`       | Whether to commit `node_modules` folder. **Note:** When set to `true`, commits will NOT be verified due to API limitations with large file counts                                                                                                                                                            | No       | `false`                 |
+| `commit_dist_folder`        | Whether to commit `dist` folder                                                                                                                                                                                                                                                                              | No       | `true`                  |
+| `publish_minor_version`     | Whether to publish minor version tag (e.g., `v1.2`)                                                                                                                                                                                                                                                          | No       | `false`                 |
+| `publish_release_branch`    | Whether to publish release branch (e.g., `releases/v1.2.3`)                                                                                                                                                                                                                                                  | No       | `false`                 |
+| `create_release_as_draft`   | Whether to create release as draft to allow review of the release before publishing; useful with [immutable releases](https://docs.github.com/en/actions/how-tos/create-and-publish-actions/using-immutable-releases-and-tags-to-manage-your-actions-releases) where changes cannot be made after publishing | No       | `false`                 |
+| `draft_release_pr_reminder` | Post a reminder comment on the merged PR when creating a draft release                                                                                                                                                                                                                                       | No       | `false`                 |
 
 ### Commit Signing Behavior
 
@@ -43,6 +44,23 @@ The action automatically handles clean builds and file management:
 
 - **Dist folder cleaning**: When `commit_dist_folder: true` and `npm_package_command` is specified, the `dist/` folder is cleaned before building to ensure no stale files persist
 - **Automatic file deletion**: The action removes `.github/` files from release commits and properly handles renamed/deleted files in the `dist/` folder
+
+## Permissions
+
+The action requires specific permissions depending on features used:
+
+| Permission             | Required | Purpose                                                                |
+| ---------------------- | -------- | ---------------------------------------------------------------------- |
+| `contents: write`      | Yes      | Push tags and create releases                                          |
+| `pull-requests: write` | No       | Post reminder comment on merged PR (`draft_release_pr_reminder: true`) |
+
+Example with all permissions:
+
+```yml
+permissions:
+  contents: write
+  pull-requests: write # only needed if using draft_release_pr_reminder
+```
 
 ## Example Workflow
 
@@ -72,4 +90,5 @@ jobs:
           publish_minor_version: false
           publish_release_branch: false
           create_release_as_draft: false
+          draft_release_pr_reminder: true
 ```
