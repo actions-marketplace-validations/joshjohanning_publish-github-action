@@ -30,11 +30,14 @@ updates:
     commit-message:
       prefix: 'chore'
       include: 'scope'
+    cooldown:
+      default-days: 3
     groups:
       github:
         patterns:
           - '@actions/*'
           - '@octokit/*'
-      eslint:
+      eslint-plugins:
         patterns:
-          - 'eslint*'
+          - 'eslint-plugin-*'
+          - 'eslint-config-*'

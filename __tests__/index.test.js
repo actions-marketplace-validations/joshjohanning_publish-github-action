@@ -10,7 +10,8 @@ const mockCore = {
   setFailed: jest.fn(),
   info: jest.fn(),
   warning: jest.fn(),
-  error: jest.fn()
+  error: jest.fn(),
+  debug: jest.fn()
 };
 
 // Mock the @actions/exec module
@@ -48,11 +49,30 @@ const mockOctokit = {
       createRef: jest.fn()
     },
     issues: {
-      createComment: jest.fn()
+      createComment: jest.fn(),
+      listComments: jest.fn(),
+      updateComment: jest.fn()
+    },
+    users: {
+      getAuthenticated: jest.fn()
     }
   },
+  paginate: jest.fn(),
+  graphql: jest.fn(),
   request: jest.fn()
 };
+mockOctokit.paginate.iterator = jest.fn();
+
+/**
+ * Creates an async iterable that yields pages of data, simulating octokit.paginate.iterator().
+ * @param {Array<Array>} pages - Array of page arrays. Each inner array is one page of results.
+ * @returns {AsyncGenerator<{data: Array}>} Async generator yielding { data: page } objects.
+ */
+async function* asyncPages(pages) {
+  for (const page of pages) {
+    yield { data: page };
+  }
+}
 
 // Mock fs module
 const mockFs = {
@@ -62,7 +82,11 @@ const mockFs = {
   rmSync: jest.fn()
 };
 
-// Mock semver module
+// Import real semver for pure comparison functions used in release baseline selection
+const realSemver = await import('semver');
+
+// Mock semver module — only mock major/minor which need controlled return values;
+// valid/lt/rcompare use real implementations for accurate test behavior
 const mockSemver = {
   major: jest.fn(),
   minor: jest.fn()
@@ -80,11 +104,14 @@ jest.unstable_mockModule('fs', () => ({
 }));
 jest.unstable_mockModule('semver', () => ({
   major: mockSemver.major,
-  minor: mockSemver.minor
+  minor: mockSemver.minor,
+  valid: realSemver.default.valid,
+  lt: realSemver.default.lt,
+  rcompare: realSemver.default.rcompare
 }));
 
 // Import the main module after mocking
-const { default: run } = await import('../src/index.js');
+const { default: run, retryWithBackoff, isTransientError, parsePullRequestNumbers } = await import('../src/index.js');
 
 describe('Publish GitHub Action', () => {
   beforeEach(() => {
@@ -130,12 +157,22 @@ describe('Publish GitHub Action', () => {
 
     // Mock GitHub API calls
     mockOctokit.rest.repos.listTags.mockResolvedValue({ data: [] });
-    mockOctokit.rest.repos.listReleases.mockResolvedValue({ data: [] });
+    mockOctokit.paginate.mockResolvedValue([]);
+    mockOctokit.paginate.iterator.mockImplementation(() => asyncPages([]));
     mockOctokit.rest.repos.createRelease.mockResolvedValue({
       data: { id: 123, html_url: 'https://github.com/test-owner/test-repo/releases/tag/v1.2.3' }
     });
     mockOctokit.rest.repos.listPullRequestsAssociatedWithCommit.mockResolvedValue({ data: [] });
     mockOctokit.rest.issues.createComment.mockResolvedValue({ data: { id: 456 } });
+    mockOctokit.rest.issues.updateComment.mockResolvedValue({ data: { id: 456 } });
+    mockOctokit.rest.users.getAuthenticated.mockResolvedValue({ data: { login: 'test-bot' } });
+    mockOctokit.graphql.mockResolvedValue({
+      repository: {
+        pullRequest: {
+          closingIssuesReferences: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } }
+        }
+      }
+    });
     mockOctokit.request.mockResolvedValue({ data: { body: 'Generated release notes' } });
 
     // Mock Git API calls
@@ -292,9 +329,9 @@ describe('Publish GitHub Action', () => {
     });
 
     test('should generate release notes with previous tag', async () => {
-      mockOctokit.rest.repos.listReleases.mockResolvedValue({
-        data: [{ tag_name: 'v1.2.2' }, { tag_name: 'v1.2.1' }]
-      });
+      mockOctokit.paginate.iterator.mockImplementation(() =>
+        asyncPages([[{ tag_name: 'v1.2.2' }, { tag_name: 'v1.2.1' }]])
+      );
 
       await run();
 
@@ -345,7 +382,9 @@ describe('Publish GitHub Action', () => {
     });
 
     test('should handle previous releases fetch failure', async () => {
-      mockOctokit.rest.repos.listReleases.mockRejectedValue(new Error('API Error'));
+      mockOctokit.paginate.iterator.mockImplementation(() => {
+        throw new Error('API Error');
+      });
 
       await run();
 
@@ -355,6 +394,135 @@ describe('Publish GitHub Action', () => {
         repo: 'test-repo',
         tag_name: 'v1.2.3'
       });
+    });
+
+    test('should skip non-semver release tags when finding previous tag', async () => {
+      mockOctokit.paginate.iterator.mockImplementation(() =>
+        asyncPages([[{ tag_name: 'nightly-2026-04-15' }, { tag_name: 'v1.2.2' }, { tag_name: 'v1.2.1' }]])
+      );
+
+      await run();
+
+      expect(mockOctokit.request).toHaveBeenCalledWith('POST /repos/{owner}/{repo}/releases/generate-notes', {
+        owner: 'test-owner',
+        repo: 'test-repo',
+        tag_name: 'v1.2.3',
+        previous_tag_name: 'v1.2.2'
+      });
+    });
+
+    test('should pick highest version less than current, not chronologically newest', async () => {
+      // v2.0.6 was created after v4.0.0 (hotpatch), but we're publishing v4.0.1
+      mockOctokit.paginate.iterator.mockImplementation(() =>
+        asyncPages([[{ tag_name: 'v2.0.6' }, { tag_name: 'v4.0.0' }, { tag_name: 'v2.0.5' }]])
+      );
+
+      mockCore.getInput.mockImplementation(name => {
+        const inputs = {
+          github_token: 'test-token',
+          github_api_url: 'https://api.github.com',
+          npm_package_command: 'npm run package',
+          commit_node_modules: 'false',
+          commit_dist_folder: 'true',
+          publish_minor_version: 'false',
+          publish_release_branch: 'false',
+          create_release_as_draft: 'false',
+          draft_release_pr_reminder: 'true'
+        };
+        return inputs[name] || '';
+      });
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify({ name: 'test-action', version: '4.0.1' }));
+      mockSemver.major.mockReturnValue(4);
+      mockSemver.minor.mockReturnValue(0);
+
+      await run();
+
+      // Should use v4.0.0 (highest < v4.0.1), not v2.0.6 (most recently created)
+      expect(mockOctokit.request).toHaveBeenCalledWith(
+        'POST /repos/{owner}/{repo}/releases/generate-notes',
+        expect.objectContaining({
+          previous_tag_name: 'v4.0.0'
+        })
+      );
+    });
+
+    test('should select correct baseline for backport releases', async () => {
+      // Publishing v2.0.7 when v4.0.1 and v2.0.6 exist — should pick v2.0.6
+      mockOctokit.paginate.iterator.mockImplementation(() =>
+        asyncPages([[{ tag_name: 'v4.0.1' }, { tag_name: 'v4.0.0' }, { tag_name: 'v2.0.6' }, { tag_name: 'v2.0.5' }]])
+      );
+
+      mockCore.getInput.mockImplementation(name => {
+        const inputs = {
+          github_token: 'test-token',
+          github_api_url: 'https://api.github.com',
+          npm_package_command: 'npm run package',
+          commit_node_modules: 'false',
+          commit_dist_folder: 'true',
+          publish_minor_version: 'false',
+          publish_release_branch: 'false',
+          create_release_as_draft: 'false',
+          draft_release_pr_reminder: 'true'
+        };
+        return inputs[name] || '';
+      });
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify({ name: 'test-action', version: '2.0.7' }));
+      mockSemver.major.mockReturnValue(2);
+      mockSemver.minor.mockReturnValue(0);
+
+      await run();
+
+      // Should use v2.0.6 (highest < v2.0.7), not v4.0.1
+      expect(mockOctokit.request).toHaveBeenCalledWith(
+        'POST /repos/{owner}/{repo}/releases/generate-notes',
+        expect.objectContaining({
+          previous_tag_name: 'v2.0.6'
+        })
+      );
+    });
+
+    test('should find correct baseline across multiple pages with early termination', async () => {
+      // Page 1: recent backport releases (lower semver)
+      // Page 2: the actual best candidate v4.9.0
+      // The short-circuit should NOT break early after page 1 since page 1 improved the candidate
+      mockOctokit.paginate.iterator.mockImplementation(() =>
+        asyncPages([
+          [{ tag_name: 'v1.0.5' }, { tag_name: 'v1.0.4' }, { tag_name: 'v1.0.3' }],
+          [{ tag_name: 'v4.9.0' }, { tag_name: 'v4.8.0' }],
+          [{ tag_name: 'v3.0.0' }, { tag_name: 'v2.0.0' }]
+        ])
+      );
+
+      mockCore.getInput.mockImplementation(name => {
+        const inputs = {
+          github_token: 'test-token',
+          github_api_url: 'https://api.github.com',
+          npm_package_command: 'npm run package',
+          commit_node_modules: 'false',
+          commit_dist_folder: 'true',
+          publish_minor_version: 'false',
+          publish_release_branch: 'false',
+          create_release_as_draft: 'false',
+          draft_release_pr_reminder: 'false'
+        };
+        return inputs[name] || '';
+      });
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify({ name: 'test-action', version: '5.0.0' }));
+      mockSemver.major.mockReturnValue(5);
+      mockSemver.minor.mockReturnValue(0);
+
+      await run();
+
+      // Should find v4.9.0 on page 2 (highest < v5.0.0), and stop before page 3
+      expect(mockOctokit.request).toHaveBeenCalledWith(
+        'POST /repos/{owner}/{repo}/releases/generate-notes',
+        expect.objectContaining({
+          previous_tag_name: 'v4.9.0'
+        })
+      );
     });
 
     test('should create release as draft when create_release_as_draft is true', async () => {
@@ -1177,6 +1345,725 @@ describe('Publish GitHub Action', () => {
       // Should warn but not fail
       expect(mockCore.warning).toHaveBeenCalledWith('Could not post PR comment: API Error');
       expect(mockCore.info).toHaveBeenCalledWith('✅ Action completed successfully!');
+    });
+  });
+
+  describe('parsePullRequestNumbers', () => {
+    test('should parse PR URLs from release notes', () => {
+      const text =
+        `## What's Changed\n` +
+        '* Fix login bug by @user in https://github.com/test-owner/test-repo/pull/42\n' +
+        '* New feature by @user in https://github.com/test-owner/test-repo/pull/43\n';
+      expect(parsePullRequestNumbers(text)).toEqual(expect.arrayContaining([42, 43]));
+    });
+
+    test('should deduplicate PR numbers', () => {
+      const text = 'Mentioned in https://github.com/owner/repo/pull/10 and also /pull/10';
+      expect(parsePullRequestNumbers(text)).toEqual([10]);
+    });
+
+    test('should return empty array for empty or null text', () => {
+      expect(parsePullRequestNumbers('')).toEqual([]);
+      expect(parsePullRequestNumbers(null)).toEqual([]);
+      expect(parsePullRequestNumbers(undefined)).toEqual([]);
+    });
+
+    test('should return empty array when no PR URLs present', () => {
+      expect(parsePullRequestNumbers('No PRs here, just #42')).toEqual([]);
+    });
+  });
+
+  describe('Comment on linked issues', () => {
+    const linkedIssuesInputs = {
+      github_token: 'test-token',
+      npm_package_command: 'npm run package',
+      commit_node_modules: 'false',
+      commit_dist_folder: 'true',
+      comment_on_linked_issues: 'true'
+    };
+
+    const setupLinkedIssuesTest = () => {
+      mockCore.getInput.mockImplementation(name => linkedIssuesInputs[name] || '');
+      mockFs.readFileSync.mockImplementation((path, _encoding) => {
+        if (path === 'package.json') {
+          return JSON.stringify({ name: 'test-action', version: '1.2.3' });
+        }
+        return 'dist file content';
+      });
+    };
+
+    const graphqlClosingIssuesResponse = (issues, pageInfo) => ({
+      repository: {
+        pullRequest: {
+          closingIssuesReferences: {
+            nodes: issues.map(i => ({
+              number: i.number,
+              state: i.state || 'CLOSED',
+              repository: {
+                owner: { login: i.owner || 'test-owner' },
+                name: i.repo || 'test-repo'
+              }
+            })),
+            pageInfo: pageInfo || { hasNextPage: false, endCursor: null }
+          }
+        }
+      }
+    });
+
+    test('should comment on closed issues linked to PRs in release notes', async () => {
+      setupLinkedIssuesTest();
+      mockOctokit.request.mockResolvedValue({
+        data: {
+          body:
+            '* Fix by @user in https://github.com/test-owner/test-repo/pull/42\n' +
+            '* Update by @user in https://github.com/test-owner/test-repo/pull/43\n'
+        }
+      });
+      mockOctokit.graphql
+        .mockResolvedValueOnce(graphqlClosingIssuesResponse([{ number: 10 }]))
+        .mockResolvedValueOnce(graphqlClosingIssuesResponse([{ number: 20 }]));
+      // No existing comments — paginate returns [] for listing comments
+      mockOctokit.paginate.mockImplementation((method, _opts) => {
+        if (method === mockOctokit.rest.issues.listComments) {
+          return Promise.resolve([]);
+        }
+        return Promise.resolve([]);
+      });
+
+      await run();
+
+      expect(mockOctokit.graphql).toHaveBeenCalledTimes(2);
+      expect(mockOctokit.rest.issues.createComment).toHaveBeenCalledWith(
+        expect.objectContaining({ issue_number: 10, body: expect.stringContaining('shipped in **v1.2.3**') })
+      );
+      expect(mockOctokit.rest.issues.createComment).toHaveBeenCalledWith(
+        expect.objectContaining({ issue_number: 20, body: expect.stringContaining('shipped in **v1.2.3**') })
+      );
+      expect(mockCore.info).toHaveBeenCalledWith('Processed 2 closed issue(s)');
+    });
+
+    test('should use predictable tag URL instead of draft release URL for linked issue comments', async () => {
+      setupLinkedIssuesTest();
+      // Override inputs to simulate draft release scenario
+      mockCore.getInput.mockImplementation(name => {
+        if (name === 'create_release_as_draft') return 'true';
+        return linkedIssuesInputs[name] || '';
+      });
+      // Simulate a draft release with untagged URL
+      mockOctokit.rest.repos.createRelease.mockResolvedValue({
+        data: {
+          id: 123,
+          html_url: 'https://github.com/test-owner/test-repo/releases/tag/untagged-edd26f475091d889baa9'
+        }
+      });
+      mockOctokit.request.mockResolvedValue({
+        data: { body: '* Fix by @user in https://github.com/test-owner/test-repo/pull/42\n' }
+      });
+      mockOctokit.graphql.mockResolvedValue(graphqlClosingIssuesResponse([{ number: 10 }]));
+      mockOctokit.paginate.mockImplementation((method, _opts) => {
+        if (method === mockOctokit.rest.issues.listComments) {
+          return Promise.resolve([]);
+        }
+        return Promise.resolve([]);
+      });
+
+      await run();
+
+      // Should use the predictable tag-based URL, not the untagged draft URL
+      expect(mockOctokit.rest.issues.createComment).toHaveBeenCalledWith(
+        expect.objectContaining({
+          issue_number: 10,
+          body: expect.stringContaining('releases/tag/v1.2.3')
+        })
+      );
+      expect(mockOctokit.rest.issues.createComment).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: expect.not.stringContaining('untagged-')
+        })
+      );
+    });
+
+    test('should skip open issues from GraphQL response', async () => {
+      setupLinkedIssuesTest();
+      mockOctokit.request.mockResolvedValue({
+        data: { body: '* Fix by @user in https://github.com/test-owner/test-repo/pull/42\n' }
+      });
+      mockOctokit.graphql.mockResolvedValue(graphqlClosingIssuesResponse([{ number: 10, state: 'OPEN' }]));
+
+      await run();
+
+      expect(mockOctokit.rest.issues.createComment).not.toHaveBeenCalled();
+      expect(mockCore.info).toHaveBeenCalledWith('No closed linked issues found across PRs');
+    });
+
+    test('should skip issues from different repos', async () => {
+      setupLinkedIssuesTest();
+      mockOctokit.request.mockResolvedValue({
+        data: { body: '* Fix by @user in https://github.com/test-owner/test-repo/pull/42\n' }
+      });
+      mockOctokit.graphql.mockResolvedValue(
+        graphqlClosingIssuesResponse([{ number: 10, owner: 'other-owner', repo: 'other-repo' }])
+      );
+
+      await run();
+
+      expect(mockOctokit.rest.issues.createComment).not.toHaveBeenCalled();
+    });
+
+    test('should handle case-insensitive owner/repo comparison', async () => {
+      setupLinkedIssuesTest();
+      mockOctokit.request.mockResolvedValue({
+        data: { body: '* Fix by @user in https://github.com/test-owner/test-repo/pull/42\n' }
+      });
+      mockOctokit.graphql.mockResolvedValue(
+        graphqlClosingIssuesResponse([{ number: 10, owner: 'Test-Owner', repo: 'Test-Repo' }])
+      );
+      mockOctokit.paginate.mockImplementation((method, _opts) => {
+        if (method === mockOctokit.rest.issues.listComments) {
+          return Promise.resolve([]);
+        }
+        return Promise.resolve([]);
+      });
+
+      await run();
+
+      expect(mockOctokit.rest.issues.createComment).toHaveBeenCalledWith(expect.objectContaining({ issue_number: 10 }));
+    });
+
+    test('should not run when comment_on_linked_issues is false', async () => {
+      mockCore.getInput.mockImplementation(name => {
+        if (name === 'comment_on_linked_issues') return 'false';
+        return linkedIssuesInputs[name] || '';
+      });
+      mockFs.readFileSync.mockImplementation((path, _encoding) => {
+        if (path === 'package.json') {
+          return JSON.stringify({ name: 'test-action', version: '1.2.3' });
+        }
+        return 'dist file content';
+      });
+      mockOctokit.request.mockResolvedValue({
+        data: { body: '* Fix in https://github.com/test-owner/test-repo/pull/42\n' }
+      });
+
+      await run();
+
+      expect(mockOctokit.graphql).not.toHaveBeenCalled();
+    });
+
+    test('should handle no PRs in release notes', async () => {
+      setupLinkedIssuesTest();
+      mockOctokit.request.mockResolvedValue({ data: { body: 'No PRs here' } });
+
+      await run();
+
+      expect(mockOctokit.graphql).not.toHaveBeenCalled();
+      expect(mockCore.info).toHaveBeenCalledWith('No pull request references found in release notes');
+    });
+
+    test('should handle GraphQL failure gracefully', async () => {
+      setupLinkedIssuesTest();
+      mockOctokit.request.mockResolvedValue({
+        data: { body: '* Fix in https://github.com/test-owner/test-repo/pull/42\n' }
+      });
+      mockOctokit.graphql.mockRejectedValue(new Error('GraphQL Error'));
+
+      await run();
+
+      expect(mockCore.warning).toHaveBeenCalledWith(
+        expect.stringContaining('Could not fetch linked issues for PR #42')
+      );
+      expect(mockCore.info).toHaveBeenCalledWith('✅ Action completed successfully!');
+    });
+
+    test('should update existing comment instead of creating duplicate', async () => {
+      setupLinkedIssuesTest();
+      mockOctokit.request.mockResolvedValue({
+        data: { body: '* Fix in https://github.com/test-owner/test-repo/pull/42\n' }
+      });
+      mockOctokit.graphql.mockResolvedValue(graphqlClosingIssuesResponse([{ number: 10 }]));
+      // Existing comment with marker but old version, authored by the bot
+      mockOctokit.paginate.mockImplementation((method, _opts) => {
+        if (method === mockOctokit.rest.issues.listComments) {
+          return Promise.resolve([
+            {
+              id: 999,
+              user: { login: 'test-bot' },
+              body: '<!-- publish-github-action-release -->\n🚀 This has been shipped in **v1.2.2**! ([Release notes](https://old-url))'
+            }
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      await run();
+
+      expect(mockOctokit.rest.issues.updateComment).toHaveBeenCalledWith(
+        expect.objectContaining({
+          comment_id: 999,
+          body: expect.stringContaining('shipped in **v1.2.3**')
+        })
+      );
+      // Should NOT create a new comment
+      const createCalls = mockOctokit.rest.issues.createComment.mock.calls.filter(call => call[0].issue_number === 10);
+      expect(createCalls).toHaveLength(0);
+    });
+
+    test('should skip update when existing comment is already up to date', async () => {
+      setupLinkedIssuesTest();
+      mockOctokit.request.mockResolvedValue({
+        data: { body: '* Fix in https://github.com/test-owner/test-repo/pull/42\n' }
+      });
+      mockOctokit.graphql.mockResolvedValue(graphqlClosingIssuesResponse([{ number: 10 }]));
+      // Existing comment already matches current version, authored by the bot
+      mockOctokit.paginate.mockImplementation((method, _opts) => {
+        if (method === mockOctokit.rest.issues.listComments) {
+          return Promise.resolve([
+            {
+              id: 999,
+              user: { login: 'test-bot' },
+              body: '<!-- publish-github-action-release -->\n🚀 This has been shipped in **v1.2.3**! ([Release notes](https://github.com/test-owner/test-repo/releases/tag/v1.2.3))'
+            }
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      await run();
+
+      expect(mockOctokit.rest.issues.updateComment).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.issues.createComment).not.toHaveBeenCalled();
+      expect(mockCore.info).toHaveBeenCalledWith('Release comment on issue #10 is already up to date');
+    });
+
+    test('should include release URL in comment body', async () => {
+      setupLinkedIssuesTest();
+      mockOctokit.request.mockResolvedValue({
+        data: { body: '* Fix in https://github.com/test-owner/test-repo/pull/42\n' }
+      });
+      mockOctokit.graphql.mockResolvedValue(graphqlClosingIssuesResponse([{ number: 10 }]));
+      mockOctokit.paginate.mockImplementation((method, _opts) => {
+        if (method === mockOctokit.rest.issues.listComments) {
+          return Promise.resolve([]);
+        }
+        return Promise.resolve([]);
+      });
+
+      await run();
+
+      expect(mockOctokit.rest.issues.createComment).toHaveBeenCalledWith(
+        expect.objectContaining({
+          issue_number: 10,
+          body: expect.stringContaining('https://github.com/test-owner/test-repo/releases/tag/v1.2.3')
+        })
+      );
+    });
+
+    test('should deduplicate issues linked from multiple PRs', async () => {
+      setupLinkedIssuesTest();
+      mockOctokit.request.mockResolvedValue({
+        data: {
+          body:
+            '* Fix in https://github.com/test-owner/test-repo/pull/42\n' +
+            '* Also in https://github.com/test-owner/test-repo/pull/43\n'
+        }
+      });
+      // Both PRs link to the same issue #10
+      mockOctokit.graphql
+        .mockResolvedValueOnce(graphqlClosingIssuesResponse([{ number: 10 }]))
+        .mockResolvedValueOnce(graphqlClosingIssuesResponse([{ number: 10 }]));
+      mockOctokit.paginate.mockImplementation((method, _opts) => {
+        if (method === mockOctokit.rest.issues.listComments) {
+          return Promise.resolve([]);
+        }
+        return Promise.resolve([]);
+      });
+
+      await run();
+
+      // Should only comment once on issue #10
+      const createCalls = mockOctokit.rest.issues.createComment.mock.calls.filter(call => call[0].issue_number === 10);
+      expect(createCalls).toHaveLength(1);
+    });
+
+    test('should ignore marker comment authored by a different user', async () => {
+      setupLinkedIssuesTest();
+      mockOctokit.request.mockResolvedValue({
+        data: { body: '* Fix in https://github.com/test-owner/test-repo/pull/42\n' }
+      });
+      mockOctokit.graphql.mockResolvedValue(graphqlClosingIssuesResponse([{ number: 10 }]));
+      // Marker comment exists but authored by someone else
+      mockOctokit.paginate.mockImplementation((method, _opts) => {
+        if (method === mockOctokit.rest.issues.listComments) {
+          return Promise.resolve([
+            {
+              id: 888,
+              user: { login: 'some-other-user' },
+              body: '<!-- publish-github-action-release -->\n🚀 This has been shipped in **v1.0.0**! ([Release notes](https://old))'
+            }
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      await run();
+
+      // Should create a new comment, not update the foreign one
+      expect(mockOctokit.rest.issues.createComment).toHaveBeenCalledWith(
+        expect.objectContaining({ issue_number: 10, body: expect.stringContaining('shipped in **v1.2.3**') })
+      );
+      expect(mockOctokit.rest.issues.updateComment).not.toHaveBeenCalled();
+    });
+
+    test('should paginate closingIssuesReferences across multiple pages', async () => {
+      setupLinkedIssuesTest();
+      mockOctokit.request.mockResolvedValue({
+        data: { body: '* Fix in https://github.com/test-owner/test-repo/pull/42\n' }
+      });
+      // First page has issue #10 with hasNextPage, second page has issue #20
+      mockOctokit.graphql
+        .mockResolvedValueOnce(
+          graphqlClosingIssuesResponse([{ number: 10 }], { hasNextPage: true, endCursor: 'cursor1' })
+        )
+        .mockResolvedValueOnce(graphqlClosingIssuesResponse([{ number: 20 }]));
+      mockOctokit.paginate.mockImplementation((method, _opts) => {
+        if (method === mockOctokit.rest.issues.listComments) {
+          return Promise.resolve([]);
+        }
+        return Promise.resolve([]);
+      });
+
+      await run();
+
+      expect(mockOctokit.graphql).toHaveBeenCalledTimes(2);
+      expect(mockOctokit.rest.issues.createComment).toHaveBeenCalledWith(expect.objectContaining({ issue_number: 10 }));
+      expect(mockOctokit.rest.issues.createComment).toHaveBeenCalledWith(expect.objectContaining({ issue_number: 20 }));
+    });
+
+    test('should create new comment when getAuthenticated fails and marker exists from other user', async () => {
+      setupLinkedIssuesTest();
+      mockOctokit.request.mockResolvedValue({
+        data: { body: '* Fix in https://github.com/test-owner/test-repo/pull/42\n' }
+      });
+      mockOctokit.graphql.mockResolvedValue(graphqlClosingIssuesResponse([{ number: 10 }]));
+      // getAuthenticated fails — authenticatedLogin will be null
+      mockOctokit.rest.users.getAuthenticated.mockRejectedValue(new Error('Token lacks user scope'));
+      // Marker comment exists from another user
+      mockOctokit.paginate.mockImplementation((method, _opts) => {
+        if (method === mockOctokit.rest.issues.listComments) {
+          return Promise.resolve([
+            {
+              id: 777,
+              user: { login: 'someone-else' },
+              body: '<!-- publish-github-action-release -->\n🚀 This has been shipped in **v1.0.0**! ([Release notes](https://old))'
+            }
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      await run();
+
+      // With null auth, should create new rather than risk updating foreign comment
+      expect(mockOctokit.rest.issues.createComment).toHaveBeenCalledWith(
+        expect.objectContaining({ issue_number: 10, body: expect.stringContaining('shipped in **v1.2.3**') })
+      );
+      expect(mockOctokit.rest.issues.updateComment).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('retryWithBackoff', () => {
+    beforeEach(() => {
+      jest.useFakeTimers();
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    test('should return result on first success', async () => {
+      const fn = jest.fn().mockResolvedValue('success');
+
+      const result = await retryWithBackoff(fn, { retries: 3, baseDelay: 100 });
+
+      expect(result).toBe('success');
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    test('should execute once when retries is negative', async () => {
+      const error = new Error('server error');
+      error.status = 500;
+      const fn = jest.fn().mockRejectedValueOnce(error).mockResolvedValue('success');
+
+      await expect(retryWithBackoff(fn, { retries: -1, baseDelay: 100 })).rejects.toThrow('server error');
+
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    test('should fall back to defaults for non-numeric retries and baseDelay', async () => {
+      const fn = jest.fn().mockResolvedValue('success');
+
+      const result = await retryWithBackoff(fn, { retries: 'foo', baseDelay: 'bar' });
+
+      expect(result).toBe('success');
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    test('should retry on transient failure and succeed', async () => {
+      const error = new Error('server error');
+      error.status = 500;
+      const fn = jest.fn().mockRejectedValueOnce(error).mockResolvedValue('success');
+
+      const promise = retryWithBackoff(fn, {
+        retries: 3,
+        baseDelay: 100,
+        description: 'test op'
+      });
+
+      await jest.advanceTimersByTimeAsync(100);
+
+      const result = await promise;
+
+      expect(result).toBe('success');
+      expect(fn).toHaveBeenCalledTimes(2);
+      expect(mockCore.warning).toHaveBeenCalledWith(
+        'test op failed (attempt 1/4, status: 500, code: unknown): server error. Retrying in 100ms...'
+      );
+    });
+
+    test('should fail immediately on non-retryable error', async () => {
+      const error = new Error('not found');
+      error.status = 404;
+      const fn = jest.fn().mockRejectedValue(error);
+
+      await expect(
+        retryWithBackoff(fn, {
+          retries: 3,
+          baseDelay: 100,
+          description: 'test op'
+        })
+      ).rejects.toThrow('not found');
+
+      expect(fn).toHaveBeenCalledTimes(1);
+      expect(mockCore.warning).toHaveBeenCalledWith(
+        'test op failed with non-retryable error (status: 404, code: unknown): not found'
+      );
+    });
+
+    test('should throw after all retries exhausted', async () => {
+      const error = new Error('server error');
+      error.status = 502;
+      const fn = jest.fn().mockRejectedValue(error);
+
+      const promise = retryWithBackoff(fn, {
+        retries: 2,
+        baseDelay: 10,
+        description: 'test op'
+      });
+
+      // Run assertion and timer advancement concurrently to avoid unhandled rejection
+      await Promise.all([expect(promise).rejects.toThrow('server error'), jest.advanceTimersByTimeAsync(30)]);
+
+      expect(fn).toHaveBeenCalledTimes(3); // initial + 2 retries
+      expect(mockCore.warning).toHaveBeenCalledWith(
+        'test op failed after 3 attempts (status: 502, code: unknown): server error'
+      );
+    });
+
+    test('should use exponential backoff delays', async () => {
+      const error1 = new Error('fail 1');
+      error1.status = 503;
+      const error2 = new Error('fail 2');
+      error2.status = 503;
+      const fn = jest.fn().mockRejectedValueOnce(error1).mockRejectedValueOnce(error2).mockResolvedValue('success');
+
+      const promise = retryWithBackoff(fn, {
+        retries: 3,
+        baseDelay: 1000,
+        description: 'backoff test'
+      });
+
+      await jest.advanceTimersByTimeAsync(1000);
+      await jest.advanceTimersByTimeAsync(2000);
+
+      const result = await promise;
+
+      expect(result).toBe('success');
+      expect(fn).toHaveBeenCalledTimes(3);
+      expect(mockCore.warning).toHaveBeenCalledWith(
+        'backoff test failed (attempt 1/4, status: 503, code: unknown): fail 1. Retrying in 1000ms...'
+      );
+      expect(mockCore.warning).toHaveBeenCalledWith(
+        'backoff test failed (attempt 2/4, status: 503, code: unknown): fail 2. Retrying in 2000ms...'
+      );
+    });
+
+    test('should retry network errors', async () => {
+      const error = new Error('connection reset');
+      error.code = 'ECONNRESET';
+      const fn = jest.fn().mockRejectedValueOnce(error).mockResolvedValue('success');
+
+      const promise = retryWithBackoff(fn, {
+        retries: 3,
+        baseDelay: 100,
+        description: 'network test'
+      });
+
+      await jest.advanceTimersByTimeAsync(100);
+
+      const result = await promise;
+
+      expect(result).toBe('success');
+      expect(fn).toHaveBeenCalledTimes(2);
+    });
+
+    test('should use custom shouldRetry predicate', async () => {
+      const error = new Error('Object does not exist');
+      error.status = 422;
+      const fn = jest.fn().mockRejectedValueOnce(error).mockResolvedValue('success');
+
+      const promise = retryWithBackoff(fn, {
+        retries: 3,
+        baseDelay: 100,
+        description: 'custom predicate test',
+        shouldRetry: e => e.status === 422 && /object does not exist/i.test(e.message)
+      });
+
+      await jest.advanceTimersByTimeAsync(100);
+
+      const result = await promise;
+
+      expect(result).toBe('success');
+      expect(fn).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('isTransientError', () => {
+    test('should return true for 429 rate limit', () => {
+      const error = new Error('rate limited');
+      error.status = 429;
+      expect(isTransientError(error)).toBe(true);
+    });
+
+    test('should return true for 5xx server errors', () => {
+      for (const status of [500, 502, 503, 504]) {
+        const error = new Error('server error');
+        error.status = status;
+        expect(isTransientError(error)).toBe(true);
+      }
+    });
+
+    test('should return false for client errors', () => {
+      for (const status of [400, 401, 403, 404, 422]) {
+        const error = new Error('client error');
+        error.status = status;
+        expect(isTransientError(error)).toBe(false);
+      }
+    });
+
+    test('should return true for transient network codes', () => {
+      for (const code of ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN']) {
+        const error = new Error('network error');
+        error.code = code;
+        expect(isTransientError(error)).toBe(true);
+      }
+    });
+
+    test('should return false for null/undefined', () => {
+      expect(isTransientError(null)).toBe(false);
+      expect(isTransientError(undefined)).toBe(false);
+    });
+
+    test('should return false for unknown errors', () => {
+      expect(isTransientError(new Error('unknown'))).toBe(false);
+    });
+  });
+
+  describe('updateRef retry behavior', () => {
+    beforeEach(() => {
+      jest.useFakeTimers();
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    test('should retry updateRef on transient Object does not exist error', async () => {
+      mockCore.getInput.mockImplementation(name => {
+        const inputs = {
+          github_token: 'test-token',
+          commit_node_modules: 'false',
+          commit_dist_folder: 'true',
+          npm_package_command: 'npm run package'
+        };
+        return inputs[name] || '';
+      });
+
+      // Simulate the 422 "Object does not exist" transient error
+      const transientError = new Error('Object does not exist');
+      transientError.status = 422;
+      mockOctokit.rest.git.updateRef.mockRejectedValueOnce(transientError).mockResolvedValue({ data: {} });
+
+      const resultPromise = run();
+
+      // Advance past the first retry delay (1000ms)
+      await jest.advanceTimersByTimeAsync(1000);
+
+      await resultPromise;
+
+      expect(mockOctokit.rest.git.updateRef).toHaveBeenCalledTimes(2);
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining('Object does not exist'));
+      expect(mockCore.info).toHaveBeenCalledWith('✅ Action completed successfully!');
+    });
+
+    test('should not retry updateRef on non-retryable 422 error', async () => {
+      mockCore.getInput.mockImplementation(name => {
+        const inputs = {
+          github_token: 'test-token',
+          commit_node_modules: 'false',
+          commit_dist_folder: 'true',
+          npm_package_command: 'npm run package'
+        };
+        return inputs[name] || '';
+      });
+
+      const validationError = new Error('Validation Failed');
+      validationError.status = 422;
+      mockOctokit.rest.git.updateRef.mockRejectedValue(validationError);
+
+      await run();
+
+      // Should not retry — "Validation Failed" doesn't match the predicate
+      expect(mockOctokit.rest.git.updateRef).toHaveBeenCalledTimes(1);
+      expect(mockCore.setFailed).toHaveBeenCalledWith('Validation Failed');
+    });
+
+    test('should fail after all updateRef retries exhausted', async () => {
+      mockCore.getInput.mockImplementation(name => {
+        const inputs = {
+          github_token: 'test-token',
+          commit_node_modules: 'false',
+          commit_dist_folder: 'true',
+          npm_package_command: 'npm run package'
+        };
+        return inputs[name] || '';
+      });
+
+      const transientError = new Error('Object does not exist');
+      transientError.status = 422;
+      mockOctokit.rest.git.updateRef.mockRejectedValue(transientError);
+
+      const resultPromise = run();
+
+      // Advance past all retry delays (1000, 2000, 4000ms)
+      await jest.advanceTimersByTimeAsync(1000);
+      await jest.advanceTimersByTimeAsync(2000);
+      await jest.advanceTimersByTimeAsync(4000);
+
+      await resultPromise;
+
+      // initial + 3 retries = 4 calls
+      expect(mockOctokit.rest.git.updateRef).toHaveBeenCalledTimes(4);
+      expect(mockCore.setFailed).toHaveBeenCalledWith('Object does not exist');
     });
   });
 });

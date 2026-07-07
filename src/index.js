@@ -10,6 +10,101 @@ import { readFileSync, rmSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
 import * as semver from 'semver';
 
+const TRANSIENT_NETWORK_CODES = new Set([
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'ENETUNREACH',
+  'ECONNREFUSED',
+  'EPIPE'
+]);
+
+/**
+ * Determine whether an error is likely transient and should be retried.
+ * Retries HTTP 429 / 5xx and common network errors; fails fast on auth/validation errors.
+ * @param {any} error - Error thrown by the operation
+ * @returns {boolean} Whether the error should be retried
+ */
+export function isTransientError(error) {
+  if (!error) {
+    return false;
+  }
+
+  const status = error.status;
+  if (typeof status === 'number') {
+    if (status === 429) {
+      return true;
+    }
+    if (status >= 500 && status < 600) {
+      return true;
+    }
+    if (status === 400 || status === 401 || status === 403 || status === 404 || status === 422) {
+      return false;
+    }
+  }
+
+  const code = error.code;
+  if (typeof code === 'string') {
+    if (TRANSIENT_NETWORK_CODES.has(code)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Retry an async function with exponential backoff
+ * @param {Function} fn - Async function to retry
+ * @param {object} [options] - Retry options
+ * @param {number} [options.retries=3] - Maximum number of retries
+ * @param {number} [options.baseDelay=1000] - Base delay in ms
+ * @param {string} [options.description='operation'] - Description for logging
+ * @param {(error: any) => boolean} [options.shouldRetry] - Optional predicate to decide if an error is retryable
+ * @returns {Promise<*>} Result of the function
+ */
+export async function retryWithBackoff(
+  fn,
+  { retries = 3, baseDelay = 1000, description = 'operation', shouldRetry } = {}
+) {
+  const retriesNum = Number(retries);
+  retries = Number.isFinite(retriesNum) ? Math.max(0, Math.floor(retriesNum)) : 3;
+
+  const baseDelayNum = Number(baseDelay);
+  baseDelay = Number.isFinite(baseDelayNum) && baseDelayNum >= 0 ? baseDelayNum : 1000;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      const status = error?.status;
+      const code = error?.code;
+      const message = error?.message ?? String(error);
+      const retryable = typeof shouldRetry === 'function' ? shouldRetry(error) : isTransientError(error);
+
+      if (!retryable) {
+        core.warning(
+          `${description} failed with non-retryable error (status: ${status ?? 'unknown'}, code: ${code ?? 'unknown'}): ${message}`
+        );
+        throw error;
+      }
+
+      if (attempt === retries) {
+        core.warning(
+          `${description} failed after ${retries + 1} attempts (status: ${status ?? 'unknown'}, code: ${code ?? 'unknown'}): ${message}`
+        );
+        throw error;
+      }
+
+      const delay = baseDelay * Math.pow(2, attempt);
+      core.warning(
+        `${description} failed (attempt ${attempt + 1}/${retries + 1}, status: ${status ?? 'unknown'}, code: ${code ?? 'unknown'}): ${message}. Retrying in ${delay}ms...`
+      );
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+}
+
 /**
  * Create a commit using GitHub API for verified commits
  * @param {object} octokit - GitHub API client
@@ -120,13 +215,23 @@ async function createCommitViaAPI(octokit, context, branchName, version, commitD
     });
     core.info(`Created new verified commit: ${newCommit.sha}`);
 
-    // 6. Update branch reference with new commit
-    await octokit.rest.git.updateRef({
-      owner: context.repo.owner,
-      repo: context.repo.repo,
-      ref: `heads/${branchName}`,
-      sha: newCommit.sha
-    });
+    // 6. Update branch reference with new commit (retry for transient failures)
+    // The "Object does not exist" error (422) can occur transiently due to
+    // eventual consistency after creating the commit, so we include it as retryable
+    await retryWithBackoff(
+      () =>
+        octokit.rest.git.updateRef({
+          owner: context.repo.owner,
+          repo: context.repo.repo,
+          ref: `heads/${branchName}`,
+          sha: newCommit.sha
+        }),
+      {
+        description: `Updating ref heads/${branchName}`,
+        shouldRetry: error =>
+          isTransientError(error) || (error?.status === 422 && /object does not exist/i.test(error?.message))
+      }
+    );
     core.info(`Updated branch ${branchName} to ${newCommit.sha}`);
 
     return newCommit.sha;
@@ -164,6 +269,39 @@ function getFilesRecursively(dir) {
 }
 
 /**
+ * Parse pull request numbers from generated release notes.
+ * GitHub's release notes format includes PR URLs like:
+ *   https://github.com/owner/repo/pull/42
+ * @param {string | null | undefined} text - Release notes body text
+ * @returns {number[]} Array of unique PR numbers
+ */
+export function parsePullRequestNumbers(text) {
+  if (!text) {
+    return [];
+  }
+
+  const prNumbers = new Set();
+  const prUrlPattern = /\/pull\/(\d+)/g;
+  let match;
+  while ((match = prUrlPattern.exec(text)) !== null) {
+    prNumbers.add(parseInt(match[1], 10));
+  }
+  return [...prNumbers];
+}
+
+const RELEASE_COMMENT_MARKER = '<!-- publish-github-action-release -->';
+
+/**
+ * Build the release comment body with an HTML marker for idempotency.
+ * @param {string} version - Version tag (e.g. v1.2.3)
+ * @param {string} releaseUrl - URL to the release page
+ * @returns {string} Comment body
+ */
+function buildReleaseCommentBody(version, releaseUrl) {
+  return `${RELEASE_COMMENT_MARKER}\n🚀 This has been shipped in **${version}**! ([Release notes](${releaseUrl}))`;
+}
+
+/**
  * Main action logic
  */
 export async function run() {
@@ -177,6 +315,7 @@ export async function run() {
     const publishReleaseVersion = core.getInput('publish_release_branch', { required: false });
     const createReleaseAsDraft = core.getInput('create_release_as_draft', { required: false });
     const draftReleasePrReminder = core.getInput('draft_release_pr_reminder', { required: false });
+    const commentOnLinkedIssues = core.getInput('comment_on_linked_issues', { required: false });
 
     const context = github.context;
     const opts = githubApiUrl ? { baseUrl: githubApiUrl } : {};
@@ -306,28 +445,37 @@ export async function run() {
       }
     }
 
-    // Find the previous semver release to use as baseline for release notes
-    const SEMVER_TAG_PATTERN = /^v\d+\.\d+\.\d+$/;
+    // Find the previous release to use as baseline for release notes.
+    // Fetches releases and selects the highest semver-tagged release that is
+    // less than the current version. This correctly handles hotpatches and
+    // backports (e.g. publishing v2.0.7 when v4.0.1 exists picks v2.0.6).
     let previousTag;
 
     try {
-      const releases = await octokit.rest.repos.listReleases({
+      let bestCandidate;
+      for await (const { data: page } of octokit.paginate.iterator(octokit.rest.repos.listReleases, {
         owner: context.repo.owner,
         repo: context.repo.repo,
         per_page: 100
-      });
-
-      if (releases.data.length > 0) {
-        // Find the most recent release with a semver tag (vX.Y.Z pattern)
-        const semverRelease = releases.data.find(release => {
-          const tagName = release.tag_name;
-          return tagName && SEMVER_TAG_PATTERN.test(tagName);
-        });
-
-        if (semverRelease) {
-          previousTag = semverRelease.tag_name;
+      })) {
+        let pageImprovedCandidate = false;
+        for (const release of page) {
+          const tag = release.tag_name;
+          if (tag && semver.valid(tag) && semver.lt(tag, version)) {
+            if (!bestCandidate || semver.lt(bestCandidate, tag)) {
+              bestCandidate = tag;
+              pageImprovedCandidate = true;
+            }
+          }
+        }
+        // Short-circuit: GitHub returns releases newest-first, so if we have
+        // a candidate and this page didn't improve it, later pages contain
+        // older releases unlikely to yield a better match
+        if (bestCandidate && !pageImprovedCandidate) {
+          break;
         }
       }
+      previousTag = bestCandidate;
     } catch (error) {
       core.info(`Could not fetch previous releases: ${error.message}`);
     }
@@ -411,6 +559,167 @@ export async function run() {
         }
       } catch (error) {
         core.warning(`Could not post PR comment: ${error.message}`);
+      }
+    }
+
+    // Comment on closed issues linked to PRs in the release notes
+    if (commentOnLinkedIssues === 'true' && releaseNotes) {
+      try {
+        const prNumbers = parsePullRequestNumbers(releaseNotes);
+
+        if (prNumbers.length === 0) {
+          core.info('No pull request references found in release notes');
+        } else {
+          core.info(`Found ${prNumbers.length} PR(s) in release notes: ${prNumbers.join(', ')}`);
+
+          // Get authenticated user for idempotency author filtering
+          let authenticatedLogin = null;
+          try {
+            const { data: authUser } = await retryWithBackoff(() => octokit.rest.users.getAuthenticated(), {
+              retries: 2,
+              baseDelay: 1000,
+              description: 'Get authenticated user'
+            });
+            authenticatedLogin = authUser.login;
+            core.debug(`Authenticated as: ${authenticatedLogin}`);
+          } catch (error) {
+            core.debug(`Could not determine authenticated user: ${error.message}`);
+          }
+
+          // Query GraphQL for closing issue references on each PR (with pagination)
+          const linkedIssues = new Set();
+          for (const prNumber of prNumbers) {
+            try {
+              let hasNextPage = true;
+              let cursor = null;
+              while (hasNextPage) {
+                const result = await retryWithBackoff(
+                  () =>
+                    octokit.graphql(
+                      `query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
+                      repository(owner: $owner, name: $repo) {
+                        pullRequest(number: $pr) {
+                          closingIssuesReferences(first: 50, after: $cursor) {
+                            nodes {
+                              number
+                              state
+                              repository {
+                                owner { login }
+                                name
+                              }
+                            }
+                            pageInfo {
+                              hasNextPage
+                              endCursor
+                            }
+                          }
+                        }
+                      }
+                    }`,
+                      { owner: context.repo.owner, repo: context.repo.repo, pr: prNumber, cursor }
+                    ),
+                  { retries: 2, baseDelay: 1000, description: `GraphQL closingIssuesReferences for PR #${prNumber}` }
+                );
+
+                const refs = result.repository?.pullRequest?.closingIssuesReferences;
+                const closingIssues = refs?.nodes || [];
+                for (const issue of closingIssues) {
+                  const issueOwner = issue.repository?.owner?.login;
+                  const issueRepo = issue.repository?.name;
+                  // Case-insensitive comparison for owner/repo
+                  if (
+                    issueOwner?.toLowerCase() === context.repo.owner.toLowerCase() &&
+                    issueRepo?.toLowerCase() === context.repo.repo.toLowerCase() &&
+                    issue.state === 'CLOSED'
+                  ) {
+                    linkedIssues.add(issue.number);
+                  }
+                }
+
+                hasNextPage = refs?.pageInfo?.hasNextPage === true;
+                cursor = refs?.pageInfo?.endCursor || null;
+              }
+            } catch (error) {
+              core.warning(`Could not fetch linked issues for PR #${prNumber}: ${error.message}`);
+            }
+          }
+
+          if (linkedIssues.size === 0) {
+            core.info('No closed linked issues found across PRs');
+          } else {
+            core.info(`Found ${linkedIssues.size} closed linked issue(s): ${[...linkedIssues].join(', ')}`);
+
+            // Use a predictable tag-based URL instead of release.data.html_url.
+            // For draft releases, html_url contains an untagged URL that 404s
+            // after publishing. The tag-based URL works for both draft and non-draft.
+            const repoUrl = release.data.html_url.replace(/\/releases\/tag\/.*$/, '');
+            const releaseUrl = `${repoUrl}/releases/tag/${version}`;
+            const commentBody = buildReleaseCommentBody(version, releaseUrl);
+            let commentedCount = 0;
+
+            for (const issueNumber of linkedIssues) {
+              try {
+                // Check for existing comment with our marker for idempotency
+                const existingComments = await retryWithBackoff(
+                  () =>
+                    octokit.paginate(octokit.rest.issues.listComments, {
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issueNumber,
+                      per_page: 100
+                    }),
+                  { retries: 2, baseDelay: 1000, description: `List comments on issue #${issueNumber}` }
+                );
+
+                // Only consider marker comments authored by us; skip if we couldn't determine identity
+                const existingComment =
+                  authenticatedLogin === null
+                    ? null
+                    : existingComments.find(
+                        c => c.body?.includes(RELEASE_COMMENT_MARKER) && c.user?.login === authenticatedLogin
+                      );
+
+                if (existingComment) {
+                  if (existingComment.body !== commentBody) {
+                    await retryWithBackoff(
+                      () =>
+                        octokit.rest.issues.updateComment({
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          comment_id: existingComment.id,
+                          body: commentBody
+                        }),
+                      { retries: 2, baseDelay: 1000, description: `Update comment on issue #${issueNumber}` }
+                    );
+                    core.info(`Updated release comment on issue #${issueNumber}`);
+                  } else {
+                    core.info(`Release comment on issue #${issueNumber} is already up to date`);
+                  }
+                } else {
+                  await retryWithBackoff(
+                    () =>
+                      octokit.rest.issues.createComment({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        issue_number: issueNumber,
+                        body: commentBody
+                      }),
+                    { retries: 2, baseDelay: 1000, description: `Create comment on issue #${issueNumber}` }
+                  );
+                  core.info(`Posted release comment on issue #${issueNumber}`);
+                }
+
+                commentedCount++;
+              } catch (error) {
+                core.warning(`Could not process issue #${issueNumber}: ${error.message}`);
+              }
+            }
+
+            core.info(`Processed ${commentedCount} closed issue(s)`);
+          }
+        }
+      } catch (error) {
+        core.warning(`Could not comment on linked issues: ${error.message}`);
       }
     }
 
